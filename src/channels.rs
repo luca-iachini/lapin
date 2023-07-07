@@ -27,6 +27,7 @@ pub(crate) struct Channels {
     executor: Arc<dyn FullExecutor + Send + Sync>,
     frames: Frames,
     error_handler: ErrorHandler,
+    channel0: Channel,
 }
 
 impl Channels {
@@ -39,6 +40,18 @@ impl Channels {
         frames: Frames,
         executor: Arc<dyn FullExecutor + Send + Sync>,
     ) -> Self {
+        let channel0 = Channel::new(
+            0,
+            configuration.clone(),
+            connection_status.clone(),
+            global_registry.clone(),
+            waker.clone(),
+            internal_rpc.clone(),
+            frames.clone(),
+            executor.clone(),
+            None,
+        );
+        channel0.set_state(ChannelState::Connected);
         Self {
             inner: Arc::new(Mutex::new(Inner::new(configuration, waker))),
             connection_status,
@@ -47,6 +60,7 @@ impl Channels {
             executor,
             frames,
             error_handler: ErrorHandler::default(),
+            channel0,
         }
     }
 
@@ -61,23 +75,16 @@ impl Channels {
         )
     }
 
-    pub(crate) fn create_zero(&self) {
-        self.inner
-            .lock()
-            .create_channel(
-                0,
-                self.connection_status.clone(),
-                self.global_registry.clone(),
-                self.internal_rpc.clone(),
-                self.frames.clone(),
-                self.executor.clone(),
-                None,
-            )
-            .set_state(ChannelState::Connected);
+    pub(crate) fn get(&self, id: ChannelId) -> Option<Channel> {
+        if id == 0 {
+            Some(self.channel0.clone())
+        } else {
+            self.inner.lock().channels.get(&id).cloned()
+        }
     }
 
-    pub(crate) fn get(&self, id: ChannelId) -> Option<Channel> {
-        self.inner.lock().channels.get(&id).cloned()
+    pub(crate) fn channel0(&self) -> Channel {
+        self.channel0.clone()
     }
 
     pub(crate) fn remove(&self, id: ChannelId, error: Error) -> Result<()> {
@@ -118,6 +125,7 @@ impl Channels {
         for channel in self.inner.lock().channels.values() {
             channel.set_closing(None);
         }
+        self.channel0.set_closing(None);
     }
 
     pub(crate) fn set_connection_closed(&self, error: Error) {
@@ -126,6 +134,7 @@ impl Channels {
             self.frames.clear_expected_replies(id, error.clone());
             channel.set_closed(error.clone());
         }
+        self.channel0.set_closed(error.clone());
     }
 
     pub(crate) fn set_connection_error(&self, error: Error) {
@@ -144,6 +153,7 @@ impl Channels {
             self.frames.clear_expected_replies(id, error.clone());
             channel.set_connection_error(error.clone());
         }
+        self.channel0.set_connection_error(error.clone());
     }
 
     pub(crate) fn flow(&self) -> bool {
@@ -157,14 +167,15 @@ impl Channels {
     pub(crate) fn send_heartbeat(&self) {
         debug!("send heartbeat");
 
-        if let Some(channel0) = self.get(0) {
+        if self.channel0.status().connected() {
             let (promise, resolver) = Promise::new();
 
             if level_enabled!(Level::TRACE) {
                 promise.set_marker("Heartbeat".into());
             }
 
-            channel0.send_frame(AMQPFrame::Heartbeat(0), resolver, None);
+            self.channel0
+                .send_frame(AMQPFrame::Heartbeat(0), resolver, None);
             self.internal_rpc.register_internal_future(promise);
         }
     }
@@ -205,19 +216,14 @@ impl Channels {
                         AMQPHardError::FRAMEERROR.into(),
                         format!("heartbeat frame received on channel {}", channel_id).into(),
                     );
-                    if let Some(channel0) = self.get(0) {
-                        let error = error.clone();
-                        self.internal_rpc.register_internal_future(async move {
-                            channel0
-                                .connection_close(
-                                    error.get_id(),
-                                    error.get_message().as_str(),
-                                    0,
-                                    0,
-                                )
-                                .await
-                        });
-                    }
+                    let channel0 = self.channel0.clone();
+                    let error_message = error.get_message().clone();
+                    let error_id = error.get_id();
+                    self.internal_rpc.register_internal_future(async move {
+                        channel0
+                            .connection_close(error_id, error_message.as_str(), 0, 0)
+                            .await
+                    });
                     return Err(Error::ProtocolError(error));
                 }
             }
@@ -228,19 +234,14 @@ impl Channels {
                         AMQPHardError::CHANNELERROR.into(),
                         format!("content header frame received on channel {}", channel_id).into(),
                     );
-                    if let Some(channel0) = self.get(0) {
-                        let error = error.clone();
-                        self.internal_rpc.register_internal_future(async move {
-                            channel0
-                                .connection_close(
-                                    error.get_id(),
-                                    error.get_message().as_str(),
-                                    class_id,
-                                    0,
-                                )
-                                .await
-                        });
-                    }
+                    let error_message = error.get_message().clone();
+                    let error_id = error.get_id();
+                    let channel0 = self.channel0.clone();
+                    self.internal_rpc.register_internal_future(async move {
+                        channel0
+                            .connection_close(error_id, error_message.as_str(), class_id, 0)
+                            .await
+                    });
                     return Err(Error::ProtocolError(error));
                 } else {
                     self.handle_content_header_frame(

@@ -67,17 +67,14 @@ impl Connection {
             executor,
         );
         let closer = Arc::new(ConnectionCloser::new(status.clone(), internal_rpc));
-        let connection = Self {
+        Self {
             configuration,
             status,
             global_registry,
             channels,
             io_loop: ThreadHandle::default(),
             closer,
-        };
-
-        connection.channels.create_zero();
-        connection
+        }
     }
 
     /// Connect to an AMQP Server.
@@ -251,40 +248,28 @@ impl Connection {
 
     pub async fn close(&self, reply_code: ReplyCode, reply_text: &str) -> Result<()> {
         self.channels.set_connection_closing();
-        if let Some(channel0) = self.channels.get(0) {
-            channel0
-                .connection_close(reply_code, reply_text, 0, 0)
-                .await
-        } else {
-            Ok(())
-        }
+        self.channels
+            .channel0()
+            .connection_close(reply_code, reply_text, 0, 0)
+            .await
     }
 
     /// Block all consumers and publishers on this connection
     pub async fn block(&self, reason: &str) -> Result<()> {
-        if let Some(channel0) = self.channels.get(0) {
-            channel0.connection_blocked(reason).await
-        } else {
-            Err(Error::InvalidConnectionState(self.status.state()))
-        }
+        self.channels.channel0().connection_blocked(reason).await
     }
 
     /// Unblock all consumers and publishers on this connection
     pub async fn unblock(&self) -> Result<()> {
-        if let Some(channel0) = self.channels.get(0) {
-            channel0.connection_unblocked().await
-        } else {
-            Err(Error::InvalidConnectionState(self.status.state()))
-        }
+        self.channels.channel0().connection_unblocked().await
     }
 
     /// Update the secret used by some authentication module such as OAuth2
     pub async fn update_secret(&self, new_secret: &str, reason: &str) -> Result<()> {
-        if let Some(channel0) = self.channels.get(0) {
-            channel0.connection_update_secret(new_secret, reason).await
-        } else {
-            Err(Error::InvalidConnectionState(self.status.state()))
-        }
+        self.channels
+            .channel0()
+            .connection_update_secret(new_secret, reason)
+            .await
     }
 
     pub async fn connector(
@@ -359,13 +344,11 @@ impl Connection {
             promise_out.set_marker("ProtocolHeader".into());
         }
         let channels = conn.channels.clone();
-        if let Some(channel0) = channels.get(0) {
-            channel0.send_frame(
-                AMQPFrame::ProtocolHeader(ProtocolVersion::amqp_0_9_1()),
-                resolver,
-                None,
-            )
-        };
+        channels.channel0().send_frame(
+            AMQPFrame::ProtocolHeader(ProtocolVersion::amqp_0_9_1()),
+            resolver,
+            None,
+        );
         let (promise_in, resolver) = Promise::new();
         if level_enabled!(Level::TRACE) {
             promise_in.set_marker("ProtocolHeader.Ok".into());
