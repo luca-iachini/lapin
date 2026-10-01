@@ -829,9 +829,16 @@ impl Channel {
                     .amqp_client_properties
                     .insert("capabilities".into(), AMQPValue::FieldTable(capabilities));
 
-                let auth_starter = auth_provider
-                    .auth_starter()
-                    .map_err(ErrorKind::AuthProviderError)?;
+                let auth_starter = match auth_provider.auth_starter() {
+                    Ok(auth_starter) => auth_starter,
+                    Err(error) => {
+                        // Returning here drops the resolver, which answers the caller without
+                        // telling it why the handshake failed, so it is rejected with the cause.
+                        let error: Error = ErrorKind::AuthProviderError(error).into();
+                        resolver.reject(error.clone());
+                        return Err(error);
+                    }
+                };
                 let channel = self.clone();
                 let client_properties = configuration.amqp_client_properties.clone();
                 self.internal_rpc.spawn(async move {
@@ -869,9 +876,16 @@ impl Channel {
             ConnectionStep::StartOk(resolver, connection, auth_provider)
             | ConnectionStep::SecureOk(resolver, connection, auth_provider) => {
                 let channel = self.clone();
-                let response = auth_provider
-                    .continue_auth(method.challenge)
-                    .map_err(ErrorKind::AuthProviderError)?;
+                let response = match auth_provider.continue_auth(method.challenge) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        // Returning here drops the resolver, which answers the caller without
+                        // telling it why the handshake failed, so it is rejected with the cause.
+                        let error: Error = ErrorKind::AuthProviderError(error).into();
+                        resolver.reject(error.clone());
+                        return Err(error);
+                    }
+                };
                 self.internal_rpc.spawn(async move {
                     channel
                         .connection_secure_ok(response, resolver, connection, auth_provider)

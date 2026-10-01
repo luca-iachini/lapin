@@ -113,7 +113,6 @@ impl Inner {
     fn complete_pending(
         &mut self,
         success: bool,
-        delivery_tag: DeliveryTag,
         resolvers: (PromiseResolver<Confirmation>, PromiseResolver<()>),
     ) {
         let returned_message = self.returned_messages.get_waiting_message();
@@ -122,20 +121,21 @@ impl Inner {
         } else {
             Confirmation::Nack(returned_message)
         });
-        if Some(delivery_tag) == self.delivery_tag.current() {
-            resolvers.1.resolve(());
-        }
+        // Answered whichever publish this is, not just the latest one: `get_last_pending` hands
+        // out the promise for the publish that was last when it was called, and a publish after
+        // that would otherwise leave nothing to answer it.
+        resolvers.1.resolve(());
     }
 
     fn drop_all(&mut self, success: bool) {
-        for (delivery_tag, resolvers) in std::mem::take(&mut self.pending) {
-            self.complete_pending(success, delivery_tag, resolvers);
+        for (_, resolvers) in std::mem::take(&mut self.pending) {
+            self.complete_pending(success, resolvers);
         }
     }
 
     fn drop_pending(&mut self, delivery_tag: DeliveryTag, success: bool) -> AMQPResult {
         if let Some(resolvers) = self.pending.remove(&delivery_tag) {
-            self.complete_pending(success, delivery_tag, resolvers);
+            self.complete_pending(success, resolvers);
             Ok(())
         } else {
             Err(AMQPError::new(
@@ -174,11 +174,9 @@ impl Inner {
     }
 
     fn on_channel_error(&mut self, error: Error) {
-        for (delivery_tag, resolvers) in self.pending.drain() {
+        for (_, resolvers) in self.pending.drain() {
             resolvers.0.reject(error.clone());
-            if Some(delivery_tag) == self.delivery_tag.current() {
-                resolvers.1.reject(error.clone());
-            }
+            resolvers.1.reject(error.clone());
         }
         self.returned_messages.clear_dropped_confirms();
     }
@@ -186,5 +184,33 @@ impl Inner {
     fn reset(&mut self, error: Error) {
         self.delivery_tag = IdSequence::new(false);
         self.on_channel_error(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `get_last_pending` hands out the promise for whichever publish was last at the time, so a
+    /// publish made after that must not leave it with nothing to answer it: a confirmed publish
+    /// is not a failure to wait on.
+    #[test]
+    fn a_confirm_answers_the_promise_handed_out_before_the_next_publish() {
+        let acknowledgements = Acknowledgements::new(1, ReturnedMessages::default());
+        let _first = acknowledgements.register_pending();
+        let last_pending = acknowledgements
+            .get_last_pending()
+            .expect("a publish is pending");
+        let _second = acknowledgements.register_pending();
+
+        acknowledgements.ack(1).expect("delivery tag 1 is pending");
+
+        assert!(
+            last_pending
+                .try_wait()
+                .expect("the wait was answered")
+                .is_ok(),
+            "a confirmed publish must not report an error"
+        );
     }
 }

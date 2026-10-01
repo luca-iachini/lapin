@@ -60,6 +60,9 @@ pub enum ErrorKind {
 
     /// The broker did not send a heartbeat within the negotiated timeout.
     MissingHeartbeatError,
+    /// Everything that could have answered the request went away before it did, which happens
+    /// when the connection or the channel it was issued on is gone.
+    PromiseAbandoned,
 }
 
 impl Error {
@@ -159,6 +162,7 @@ impl Error {
             ErrorKind::NoDefaultRuntime => false,
 
             ErrorKind::MissingHeartbeatError => true,
+            ErrorKind::PromiseAbandoned => true,
         }
     }
 }
@@ -200,6 +204,9 @@ impl fmt::Display for Error {
 
             ErrorKind::MissingHeartbeatError => {
                 write!(f, "no heartbeat received from server for too long")
+            }
+            ErrorKind::PromiseAbandoned => {
+                write!(f, "nothing is left to answer the request")
             }
         }
     }
@@ -259,6 +266,7 @@ impl PartialEq for Error {
             (SerialisationError(_), SerialisationError(_)) => false,
             (FutureCompleted, FutureCompleted) => true,
             (NoDefaultRuntime, NoDefaultRuntime) => true,
+            (PromiseAbandoned, PromiseAbandoned) => true,
 
             _ => false,
         }

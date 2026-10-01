@@ -15,12 +15,16 @@ use crate::{
 };
 use amq_protocol::frame::AMQPFrame;
 use async_rs::{Runtime, traits::*};
-use flume::{Receiver, Sender};
+use flume::{Receiver, Sender, WeakSender};
 use std::{collections::HashMap, fmt, future::Future, sync::Arc, time::Duration};
 use tracing::{debug, trace};
 
 pub(crate) struct InternalRPC<RK: RuntimeKit + Clone + Send + 'static> {
     rpc: Receiver<Option<InternalCommand>>,
+    // The only strong sender, held so that handles can keep upgrading their weak ones. The
+    // channel closes, and this task ends, once the loop lets go of it rather than once the
+    // last user handle does.
+    _sender: Sender<Option<InternalCommand>>,
     handle: InternalRPCHandle,
     channels_status: HashMap<ChannelId, KillSwitch>,
     frames: Frames,
@@ -31,7 +35,7 @@ pub(crate) struct InternalRPC<RK: RuntimeKit + Clone + Send + 'static> {
 
 #[derive(Clone)]
 pub(crate) struct InternalRPCHandle {
-    sender: Sender<Option<InternalCommand>>,
+    sender: WeakSender<Option<InternalCommand>>,
     waker: SocketStateHandle,
 }
 
@@ -238,17 +242,25 @@ impl InternalRPCHandle {
 
     pub(crate) fn stop(&self) {
         trace!("Stopping internal RPC command");
-        let _ = self.sender.send(None);
+        if let Some(sender) = self.sender.upgrade() {
+            let _ = sender.send(None);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.sender.is_empty()
+        self.sender.upgrade().is_none_or(|sender| sender.is_empty())
     }
 
     fn send(&self, command: InternalCommand) {
         trace!(?command, "Queuing internal RPC command");
-        // The only scenario where this can fail if this is the IoLoop already exited
-        let _ = self.sender.send(Some(command));
+        // Holding a sender is what keeps the consumer around: while one exists the RPC loop
+        // cannot see the channel as disconnected, so the command is received, and so answered,
+        // whether it gets handled or dropped. Failing to upgrade drops it here instead, which
+        // rejects the promise its caller is waiting on.
+        let Some(sender) = self.sender.upgrade() else {
+            return;
+        };
+        let _ = sender.send(Some(command));
         self.waker.wake();
     }
 }
@@ -318,9 +330,13 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
         waker: SocketStateHandle,
     ) -> Self {
         let (sender, rpc) = flume::unbounded();
-        let handle = InternalRPCHandle { sender, waker };
+        let handle = InternalRPCHandle {
+            sender: sender.downgrade(),
+            waker,
+        };
         Self {
             rpc,
+            _sender: sender,
             handle,
             channels_status: Default::default(),
             frames,
@@ -383,6 +399,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
             match command {
                 BasicAck(channel_id, delivery_tag, options, resolver, error) => {
                     if !self.channel_ok(channel_id) {
+                        // Skipping the command drops its resolver, which answers the caller.
                         continue;
                     }
                     let channel = get_channel(channel_id);
@@ -398,6 +415,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 }
                 BasicNack(channel_id, delivery_tag, options, resolver, error) => {
                     if !self.channel_ok(channel_id) {
+                        // Skipping the command drops its resolver, which answers the caller.
                         continue;
                     }
                     let channel = get_channel(channel_id);
@@ -413,6 +431,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 }
                 BasicReject(channel_id, delivery_tag, options, resolver, error) => {
                     if !self.channel_ok(channel_id) {
+                        // Skipping the command drops its resolver, which answers the caller.
                         continue;
                     }
                     let channel = get_channel(channel_id);
@@ -555,6 +574,137 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
             }
             self.handle.waker.wake();
         }
+        // Keep consuming once we stop handling: a command is answered by being dropped, so it
+        // needs a consumer for as long as a sender can still reach it. Letting go of the strong
+        // sender is what stops new ones from being handed out, and what ends this once the ones
+        // already handed out are done.
+        drop(channels);
+        drop(self);
+        while rpc.recv_async().await.is_ok() {}
         trace!("InternalRPC stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ConnectionProperties, ConnectionStatus, auth::DefaultAuthProvider,
+        configuration::Configuration, events::Events, runtime, socket_state::SocketState,
+        uri::AMQPUri,
+    };
+
+    /// Keeps a value alive for the duration of a test and drops it off the async context, which
+    /// the tokio runtime a `Runtime` owns panics on.
+    struct DropOffAsync<T: Send + 'static>(Option<T>);
+
+    impl<T: Send + 'static> Drop for DropOffAsync<T> {
+        fn drop(&mut self) {
+            if let Some(value) = self.0.take() {
+                std::thread::spawn(move || drop(value));
+            }
+        }
+    }
+
+    /// An internal RPC whose loop is running, over no IO at all: a channel request is answered
+    /// by the loop itself, since the negotiated `channel_max` of an unconnected configuration
+    /// is 0 and `Channels::create` refuses before any frame is sent.
+    ///
+    /// Commands need no synchronisation against the loop: a single consumer takes them off one
+    /// queue, so they are handled in the order they are sent in.
+    fn internal_rpc() -> (
+        InternalRPCHandle,
+        Arc<ConnectionCloser>,
+        DropOffAsync<Runtime<runtime::DefaultRuntimeKit>>,
+    ) {
+        let uri = AMQPUri::default();
+        let status = ConnectionStatus::new(&uri);
+        let runtime = runtime::default_runtime().unwrap();
+        let heartbeat = Heartbeat::new(status.clone(), runtime.clone());
+        let secret_update = SecretUpdate::new(
+            status.clone(),
+            runtime.clone(),
+            Arc::new(DefaultAuthProvider::new(&uri)),
+        );
+        let socket_state = SocketState::default();
+        let frames = Frames::default();
+        let internal_rpc = InternalRPC::new(
+            runtime.clone(),
+            heartbeat,
+            secret_update,
+            frames.clone(),
+            socket_state.handle(),
+        );
+        let handle = internal_rpc.handle();
+        let channels = Channels::new(
+            Configuration::new(&uri, ConnectionProperties::default()),
+            status.clone(),
+            socket_state.handle(),
+            handle.clone(),
+            frames,
+            Events::new(),
+        );
+        internal_rpc.start(channels);
+        let closer = Arc::new(ConnectionCloser::new(status, handle.clone()));
+        closer.noop();
+        (handle, closer, DropOffAsync(Some(runtime)))
+    }
+
+    /// An ack on a channel the loop considers gone: the `channel_ok` guard skips the command
+    /// with `continue`, which drops its resolver and so rejects the ack rather than leaving it
+    /// unanswered. No race needed, and what amqp-rs/lapin#423 reports.
+    #[tokio::test]
+    async fn an_ack_on_a_killed_channel_is_answered() {
+        let (handle, _closer, _runtime) = internal_rpc();
+        let killswitch = KillSwitch::default();
+        killswitch.kill();
+        handle.set_channel_status(1, killswitch);
+
+        let (promise, resolver) = Promise::new("test.basic-ack");
+        handle.basic_ack(1, 1, BasicAckOptions::default(), resolver, None);
+
+        tokio::time::timeout(Duration::from_millis(500), promise)
+            .await
+            .expect("the ack was answered")
+            .expect_err("an ack cannot succeed on a channel that is gone");
+    }
+
+    /// The control: the loop answers, so the wait ends.
+    #[tokio::test]
+    async fn a_channel_request_the_rpc_loop_refuses_is_rejected() {
+        let (handle, closer, _runtime) = internal_rpc();
+
+        let channel = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle.create_channel(closer.clone()),
+        )
+        .await
+        .expect("the request was answered");
+
+        assert!(matches!(
+            channel.unwrap_err().kind(),
+            ErrorKind::ChannelsLimitReached
+        ));
+    }
+
+    /// The same request, once the loop has stopped as the IO loop stops it on its way out. The
+    /// command is no longer handled, and is answered by the drop of the resolver it carries,
+    /// whether the loop is still draining or the channel has nothing left to receive it.
+    #[tokio::test]
+    async fn a_channel_request_made_after_the_rpc_loop_stopped_is_answered() {
+        let (handle, closer, _runtime) = internal_rpc();
+        handle.stop();
+
+        let channel = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle.create_channel(closer.clone()),
+        )
+        .await;
+
+        let channel = channel.expect("a channel request outlived by the RPC loop is answered");
+        assert!(matches!(
+            channel.unwrap_err().kind(),
+            ErrorKind::PromiseAbandoned
+        ));
     }
 }
