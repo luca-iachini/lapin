@@ -160,6 +160,11 @@ impl Connection {
     /// state or if the channel limit negotiated with the server has been reached.
     pub async fn create_channel(&self) -> Result<Channel> {
         self.status.ensure_connected()?;
+        // INSTRUMENTATION, NOT FOR MERGE: widens the window between the status check and the
+        // queuing of the command to something a test can hit, so that the connection can die
+        // in it. In a release this window is a handful of instructions.
+        #[cfg(feature = "repro-create-channel-window")]
+        std::thread::sleep(std::time::Duration::from_millis(500));
         self.internal_rpc.create_channel(self.closer.clone()).await
     }
 
