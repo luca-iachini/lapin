@@ -922,13 +922,19 @@ impl Channel {
                 let configuration = self.configuration.clone();
                 let vhost = self.connection_status.vhost();
                 self.internal_rpc.spawn(async move {
-                    channel
+                    if let Err(error) = channel
                         .connection_tune_ok(
                             configuration.channel_max(),
                             configuration.frame_max(),
                             configuration.heartbeat(),
                         )
-                        .await?;
+                        .await
+                    {
+                        // Returning here drops the resolver, which answers the caller without
+                        // telling it why the handshake failed, so it is rejected with the cause.
+                        resolver.reject(error.clone());
+                        return Err(error);
+                    }
                     channel.connection_open(vhost, resolver, connection).await
                 });
                 Ok(())
